@@ -1,4 +1,4 @@
-# MariaDB 13.0.1-rc — Remote Code Execution (RCE)
+# MariaDB 13.0.1-rc - Remote Code Execution (RCE)
 
 ## Overview
 
